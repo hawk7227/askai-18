@@ -198,8 +198,37 @@ def load(out):
                 elif abs(left_gap - right_gap) < 12: sender = 'unknown'
                 else: sender = 'practice' if right_gap < left_gap else 'patient'
                 timeline.append({'text': txt, 'sender': sender})
-        convs[key] = {'label': label, 'names': names, 'messages': timeline}
-    return convs
+        convs[key] = {'label': label, 'names': names, 'messages': timeline, 'header_id': steps[0].get('header_id')}
+    return merge_duplicates(convs)
+
+def merge_duplicates(convs):
+    '''Same patient saved twice (older runs could not read the header): merge by header id, or when one
+    conversation's messages are (>=80%) contained in another's. Keeps the fuller copy.'''
+    keys = list(convs); parent = {k: k for k in keys}
+    def find(k):
+        while parent[k] != k: parent[k] = parent[parent[k]]; k = parent[k]
+        return k
+    by_header = {}
+    for k in keys:
+        h = convs[k].get('header_id')
+        if h:
+            if h in by_header: parent[find(k)] = find(by_header[h])
+            else: by_header[h] = k
+    sig = {k: {m['text'] for m in convs[k]['messages'] if len(m['text']) >= 15} for k in keys}
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            sa, sb = sig[a], sig[b]
+            if min(len(sa), len(sb)) >= 3 and len(sa & sb) / min(len(sa), len(sb)) >= .8:
+                parent[find(b)] = find(a)
+    groups = {}
+    for k in keys: groups.setdefault(find(k), []).append(k)
+    merged = {}
+    for members in groups.values():
+        best = max(members, key=lambda k: (bool(convs[k].get('header_id')), len(convs[k]['messages'])))
+        merged[best] = {**convs[best], 'merged_from': sorted(members)}
+    dropped = len(convs) - len(merged)
+    if dropped: print(f'Merged {dropped} duplicate conversation copies (same patient saved twice).')
+    return merged
 
 def needs_of(text):
     if SMALLTALK.match(text.strip()): return []

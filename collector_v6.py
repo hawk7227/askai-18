@@ -263,9 +263,11 @@ def header_identity(items, r, pts):
         t = min(to, key=lambda it: it['rect'][0]); cy = (t['rect'][1] + t['rect'][3]) / 2
         near = lambda it: it['rect'][0] >= t['rect'][2] - 4 and abs((it['rect'][1] + it['rect'][3]) / 2 - cy) <= 45
     else:     # no "To:" label: header strip only (below the app's top bar), and only a phone number counts
-        band_top = r[1] + round((r[3] - r[1]) * .11)
-        right_of_list = pts['first'][0] + .3 * (pts['history'][0] - pts['first'][0])
-        near = lambda it: it['rect'][0] >= right_of_list and band_top <= it['rect'][1] < limit
+        band_top = r[1] + round((r[3] - r[1]) * .10)
+        limit = r[1] + round((r[3] - r[1]) * .27)
+        top_bar = {re.sub(r'\D', '', m)[-10:] for it in items if it['rect'][1] < band_top for m in PHONE.findall(it['text'])}
+        near = lambda it: (band_top <= it['rect'][1] < limit and it['rect'][0] > pts['first'][0] - 40
+                           and not any(re.sub(r'\D', '', m)[-10:] in top_bar for m in PHONE.findall(it['text'])))
     texts = [it for it in items if near(it)
              and it['text'].strip() and it['text'].strip() not in CHROME and it['text'].strip() not in ('To:', 'To')]
     texts.sort(key=lambda it: (it['rect'][1], it['rect'][0]))
@@ -405,6 +407,22 @@ def measure_shift(before, after, allow_up=False):
     return fine[1], fine[0]
 
 # ---------------------------------------------------------------- capture one conversation
+LAST_HEADER = None
+HEADER_DEBUG_DONE = False
+def header_debug(out, items, r, pts):
+    '''First time a header cannot be read: save what UI Automation shows at the top of the window
+    (local file, may contain a name/number) and print a summary WITHOUT text (safe to screenshot).'''
+    global HEADER_DEBUG_DONE
+    if HEADER_DEBUG_DONE: return
+    HEADER_DEBUG_DONE = True
+    h = r[3] - r[1]; top = [it for it in items if it['rect'][1] < r[1] + .35 * h]
+    write(out / 'header_debug.json', {'window': r, 'points': pts, 'items': top})
+    print('NOTE: conversation header not readable - saved header_debug.json. Top-of-window elements (no text shown):')
+    for it in sorted(top, key=lambda it: (it['rect'][1], it['rect'][0]))[:30]:
+        x1, y1, x2, y2 = it['rect']
+        print(f"   {it['type']:10s} x={x1 - r[0]:5d}-{x2 - r[0]:5d} y={y1 - r[1]:4d}-{y2 - r[1]:4d} ({100 * (y1 - r[1]) / h:4.1f}%)"
+              f"  len={len(it['text']):3d} phone={'Y' if PHONE.search(it['text']) else '-'} to={'Y' if it['text'].strip() in ('To:', 'To') else '-'}")
+
 def capture_conversation(out, state, journal, cfg, key, label, x, y, scrolls, delay, headers=None):
     '''Returns 'captured' or 'duplicate' (the opened conversation's header is already saved).'''
     try:
@@ -412,6 +430,14 @@ def capture_conversation(out, state, journal, cfg, key, label, x, y, scrolls, de
         click_at(x, y, r, f'contact row {label[:40]!r}'); time.sleep(delay)
         first = elements(w)
         hid, htext = header_identity(first, r, pts)
+        global LAST_HEADER
+        for wait in range(6):   # the header is drawn a moment after the conversation opens
+            if hid and hid != LAST_HEADER: break
+            time.sleep(max(.5, delay))
+            w, r, pts, _ = geometry(cfg); first = elements(w)
+            hid, htext = header_identity(first, r, pts)
+        if not hid: header_debug(out, first, r, pts)
+        else: LAST_HEADER = hid
         if headers is not None and hid and hid in headers:
             return 'duplicate:' + hid
         row_key = key
@@ -469,6 +495,14 @@ def collect(out, pages, rows, scrolls, delay, capture_all, mode):
         print(f'Mode: {mode} ({"rows read via UI Automation" if mode == "identity" else "UIA exposes no LEFT rows; using calibrated row spacing + measured scroll"})')
     run = collect_identity if mode == 'identity' else collect_positional
     captured = run(out, state, journal, cfg, scroller, budget, scrolls, delay)
+    passes = 1; more = captured
+    while capture_all and mode == 'identity' and more > 0 and passes < 4:
+        # New messages move contacts to the top while we work; walk again until a pass finds nobody new.
+        print(f'Pass {passes} saved new conversations; checking the list again from the top for anyone it moved...')
+        scroller.to_top(); passes += 1
+        more = run(out, state, journal, cfg, scroller, budget, scrolls, delay)
+        captured += more
+        if more == 0: print('No new conversations on this pass - complete.'); break
     print(f'Collection finished: {captured} new conversation(s) this run, {len(state["completed"])} total. '
           'All output remains local; verify before clinical use.')
 
@@ -517,7 +551,10 @@ def collect_identity(out, state, journal, cfg, scroller, budget, scrolls, delay)
         shift = measure_shift(b, a)[0]; offset += shift
         after_keys = [row['key'] for row in visible_rows(cfg, at_end=stalls > 0 and scroller.method is not None)]
         if after_keys and before_keys and not (set(before_keys) & set(after_keys)) and shift == 0:
-            raise SafeStop('LEFT list changed completely without scrolling (list refreshed?). Re-run to resume.')
+            # A new message moved contacts around. Keep going: saved contacts are skipped by name/header,
+            # and the extra pass at the end catches anyone who jumped above us.
+            print('Note: contact list re-ordered (new message arrived) - continuing.')
+            opened = set(); stalls = 0; continue
         if shift == 0 and after_keys == before_keys:
             stalls += 1
             if stalls >= 3 or (stalls >= 2 and scroller.at_bottom()):
