@@ -163,7 +163,7 @@ def load(out):
     convs = {}
     for key, steps in snaps.items():
         steps.sort(key=lambda d: d['step'])
-        label = steps[0].get('row_label', key)
+        label = steps[0].get('header_text') or steps[0].get('row_label', key)
         names = [x for x in label.split(' | ') if not PHONE.search(x) and len(x) > 3 and not SMALLTALK.match(x)][:1]
         # step 0 = newest screen; each later step scrolled UP to older messages.
         # Build timeline oldest -> newest: older steps first, each screen top -> bottom.

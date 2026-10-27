@@ -84,12 +84,13 @@ def safe_target(x, y, r, what):
 
 def move_to(x, y, r, what):
     x, y = safe_target(x, y, r, what)
-    pg.moveTo(x, y)
-    p = pg.position()
-    if abs(p.x - x) > 2 or abs(p.y - y) > 2:
-        raise SafeStop(f'Pointer landed at ({p.x},{p.y}) instead of {what} ({x},{y}); '
-                       'screen coordinates disagree (display scaling). Nothing clicked.')
-    return x, y
+    for attempt in range(4):                      # a bumped mouse or scaling jitter gets retried
+        pg.moveTo(x, y)
+        p = pg.position()
+        if abs(p.x - x) <= 10 and abs(p.y - y) <= 10: return x, y
+        time.sleep(.3)
+    raise SafeStop(f'Pointer landed at ({p.x},{p.y}) instead of {what} ({x},{y}) after 4 tries; '
+                   'keep hands off the mouse, or display scaling disagrees. Nothing clicked.')
 
 def click_at(x, y, r, what):
     x, y = move_to(x, y, r, what)
@@ -235,6 +236,7 @@ def group_rows(items, r, pts, delta, top, bottom):
         if name_el['type'] not in ('ListItem', 'DataItem'):
             y = (name_el['rect'][1] + name_el['rect'][3]) / 2        # click ON the name line
         out.append({'key': 'c_' + sha(ident)[:20], 'label': ' | '.join([name] + [t for t in stable if t != name])[:160], 'name': name,
+                    'strong': strong_name(name),
                     'x': pts['first'][0], 'y': round(y)})
     return out
 
@@ -242,6 +244,49 @@ def visible_rows(cfg, at_end=False):
     w, r, pts, delta = geometry(cfg)
     top, bottom = left_viewport(r, pts, delta, at_end)
     return group_rows(elements(w), r, pts, delta, top, bottom)
+
+STATUSY = re.compile(r"\b(ext\.?\s*\d|call|voicemail|fax|welcome|thank|please|received|stop|link|appointment|sorry|image)\b|[.?!:]$", re.I)
+def strong_name(name):
+    '''True when the row's name line is a real contact name or number (not a call/preview line).'''
+    if PHONE.search(name): return True
+    if INITIALS.match(name.strip()): return False
+    words = name.split()
+    return (1 <= len(words) <= 5 and len(name) <= 45 and not STATUSY.search(name)
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9.'\- ]*", name) is not None)
+
+def header_identity(items, r, pts):
+    '''The open conversation's "To:" header (name + phone) = the real contact identity.'''
+    split = (pts['first'][0] + pts['history'][0]) // 2
+    limit = r[1] + round((r[3] - r[1]) * .23)
+    to = [it for it in items if it['text'].strip() in ('To:', 'To') and it['rect'][1] < limit]
+    if to:   # anchor on the "To:" label: the header is the text beside it
+        t = min(to, key=lambda it: it['rect'][0]); cy = (t['rect'][1] + t['rect'][3]) / 2
+        near = lambda it: it['rect'][0] >= t['rect'][2] - 4 and abs((it['rect'][1] + it['rect'][3]) / 2 - cy) <= 45
+    else:     # no "To:" label: header strip only (below the app's top bar), and only a phone number counts
+        band_top = r[1] + round((r[3] - r[1]) * .11)
+        right_of_list = pts['first'][0] + .3 * (pts['history'][0] - pts['first'][0])
+        near = lambda it: it['rect'][0] >= right_of_list and band_top <= it['rect'][1] < limit
+    texts = [it for it in items if near(it)
+             and it['text'].strip() and it['text'].strip() not in CHROME and it['text'].strip() not in ('To:', 'To')]
+    texts.sort(key=lambda it: (it['rect'][1], it['rect'][0]))
+    for it in texts:
+        m = PHONE.search(it['text'])
+        if m: return 'phone:' + re.sub(r'\D', '', m.group(0))[-10:], ' | '.join(t['text'].strip() for t in texts)[:120]
+    if texts and to: return 'name:' + norm(texts[0]['text']).lower(), ' | '.join(t['text'].strip() for t in texts)[:120]
+    return None, ''
+
+def known_headers(out, cfg):
+    '''Header identities of conversations already saved (rebuilt from snapshots, so older runs count).'''
+    seen = {}
+    try: w, r, pts, _ = geometry(cfg)
+    except Exception: return seen
+    for p in (out / 'snapshots').glob('*_s000.json'):
+        try:
+            d = json.loads(p.read_text(encoding='utf-8'))
+            hid = d.get('header_id') or header_identity(d.get('interface_controls', []) + d.get('history_candidates', []), r, pts)[0]
+            if hid: seen[hid] = d.get('key')
+        except Exception: continue
+    return seen
 
 # ---------------------------------------------------------------- LEFT list scrolling
 class LeftScroller:
@@ -360,19 +405,27 @@ def measure_shift(before, after, allow_up=False):
     return fine[1], fine[0]
 
 # ---------------------------------------------------------------- capture one conversation
-def capture_conversation(out, state, journal, cfg, key, label, x, y, scrolls, delay):
+def capture_conversation(out, state, journal, cfg, key, label, x, y, scrolls, delay, headers=None):
+    '''Returns 'captured' or 'duplicate' (the opened conversation's header is already saved).'''
     try:
         w, r, pts, _ = geometry(cfg)
         click_at(x, y, r, f'contact row {label[:40]!r}'); time.sleep(delay)
+        first = elements(w)
+        hid, htext = header_identity(first, r, pts)
+        if headers is not None and hid and hid in headers:
+            return 'duplicate:' + hid
+        row_key = key
+        if hid: key = 'h_' + sha(hid)[:20]
         unique = {}; last_signature = None; data = None
         for step in range(scrolls + 1):
             w, r, pts, _ = geometry(cfg)
-            data = classify(elements(w), r, pts)
+            data = classify(first if step == 0 else elements(w), r, pts)
             signature = sha(json.dumps([i['text'] for i in data['history_candidates']], ensure_ascii=False))
             for item in data['history_candidates']:
                 fingerprint = sha(item['classification'] + '|' + item['text'])
                 if fingerprint not in unique: unique[fingerprint] = {**item, 'fingerprint': fingerprint}
-            snapshot = {'key': key, 'row_label': label, 'step': step, 'captured_at': timestamp(),
+            snapshot = {'key': key, 'row_key': row_key, 'row_label': label, 'header_id': hid, 'header_text': htext,
+                        'step': step, 'captured_at': timestamp(),
                         'contact_candidates': data['contact_candidates'], 'history_candidates': data['history_candidates'],
                         'interface_controls': data['interface_controls'], 'history_complete': False,
                         'patient_identity_verified': False, 'sender_verified': False}
@@ -383,15 +436,19 @@ def capture_conversation(out, state, journal, cfg, key, label, x, y, scrolls, de
             last_signature = signature
             if step < scrolls:
                 move_to(*pts['history'], r, 'RIGHT history'); pg.scroll(4 * NOTCH); time.sleep(delay)
-        write(out / 'extracted' / f'{key}.json', {'key': key, 'row_label': label, 'captured_at': timestamp(),
+        write(out / 'extracted' / f'{key}.json', {'key': key, 'row_key': row_key, 'row_label': label,
+              'header_id': hid, 'header_text': htext, 'captured_at': timestamp(),
               'candidate_contact_labels': data['contact_candidates'],
               'deduplicated_history_text_candidates': list(unique.values()),
               'complete_history_verified': False, 'patient_identity_verified': False,
               'sender_attribution_verified': False, 'source': 'Windows UI Automation'})
         state['completed'].append(key); state['partial'].pop(key, None)
-        state.setdefault('labels', {})[key] = label
+        if row_key != key: state['completed'].append(row_key)
+        state.setdefault('labels', {})[key] = htext or label
+        if headers is not None and hid: headers[hid] = key
         write(journal, state)
-        print(f'{key} [{label[:50]}]: {len(unique)} unique text candidates saved (not verified messages)')
+        print(f'{key} [{(htext or label)[:50]}]: {len(unique)} unique text candidates saved (not verified messages)')
+        return 'captured'
     except Exception as e:
         state['errors'].append({'key': key, 'at': timestamp(), 'error': str(e)}); write(journal, state)
         raise
@@ -431,19 +488,33 @@ def drawn_rows(cfg, scroller, rows_):
 
 def collect_identity(out, state, journal, cfg, scroller, budget, scrolls, delay):
     done = set(state['completed']); captured = 0; stalls = 0
+    headers = known_headers(out, cfg)
+    print(f'{len(headers)} conversation(s) already saved are recognized by their header.')
+    opened = set(); offset = 0.0; same_header = {}   # nameless rows are remembered by their position in the whole list
     while budget is None or captured < budget:
         relaxed = stalls > 0 and scroller.method is not None
         rows_ = visible_rows(cfg, at_end=relaxed)
         if relaxed: rows_ = drawn_rows(cfg, scroller, rows_)
-        todo = [row for row in rows_ if row['key'] not in done]
+        pos = lambda row: (row['key'], round((row['y'] + offset) / 24))
+        todo = [row for row in rows_ if not (row['strong'] and row['key'] in done)
+                and not ({pos(row), (row['key'], pos(row)[1] - 1), (row['key'], pos(row)[1] + 1)} & opened)]
         if todo:
-            row = todo[0]
-            capture_conversation(out, state, journal, cfg, row['key'], row['label'], row['x'], row['y'], scrolls, delay)
-            done.add(row['key']); captured += 1
+            row = todo[0]; opened.add(pos(row))
+            res = capture_conversation(out, state, journal, cfg, row['key'], row['label'], row['x'], row['y'],
+                                       scrolls, delay, headers)
+            if res == 'captured': captured += 1; same_header.clear()
+            else:
+                # Different rows opening the SAME header again and again means the header is not being
+                # read (e.g. a stuck pane). Stop rather than skip people.
+                same_header[res] = same_header.get(res, set()) | {row['key']}
+                if len(same_header[res]) >= 4:
+                    raise SafeStop('Several new contacts in a row were read as already saved - the conversation '
+                                   'header is not being read correctly. Stopped so no one is skipped.')
+            if row['strong']: done.add(row['key'])
             continue                     # re-read rows: clicking can restyle/reorder the list
         before_keys = [row['key'] for row in rows_]
         b, a = scroller.step(down=True)
-        shift = measure_shift(b, a)[0]
+        shift = measure_shift(b, a)[0]; offset += shift
         after_keys = [row['key'] for row in visible_rows(cfg, at_end=stalls > 0 and scroller.method is not None)]
         if after_keys and before_keys and not (set(before_keys) & set(after_keys)) and shift == 0:
             raise SafeStop('LEFT list changed completely without scrolling (list refreshed?). Re-run to resume.')
